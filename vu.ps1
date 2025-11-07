@@ -7,7 +7,7 @@ function Show-VUHelp {
     Write-Host "  vu create [-p|--python <version>] <name>" -ForegroundColor Cyan
     Write-Host "  vu activate <name>" -ForegroundColor Cyan
     Write-Host "  vu env list" -ForegroundColor Cyan
-    Write-Host "  vu env remove <name>" -ForegroundColor Cyan
+    Write-Host "  vu env remove <name> [--force]" -ForegroundColor Cyan
     Write-Host "  vu install <package> [<more packages>...]" -ForegroundColor Cyan
     Write-Host "  vu uninstall <package> [<more packages>...]" -ForegroundColor Cyan
     Write-Host "  vu list" -ForegroundColor Cyan
@@ -15,6 +15,7 @@ function Show-VUHelp {
     Write-Host "Notes:" -ForegroundColor DarkGray
     Write-Host "  Uses env var PYTHON_VENV_DIR as root; defaults to: $HOME\\python_venvs" -ForegroundColor DarkGray
     Write-Host "  install/uninstall/list operate on the currently activated virtual env (VIRTUAL_ENV)." -ForegroundColor DarkGray
+    Write-Host "  env remove supports --force to stop python.exe from that env if needed." -ForegroundColor DarkGray
 }
 
 
@@ -90,12 +91,69 @@ function vu {
                     }
                 }
                 'remove' {
-                    if ($args.Count -lt 3) { Write-Error "Missing NAME. Usage: vu env remove <name>"; break }
+                    if ($args.Count -lt 3) { Write-Error "Missing NAME. Usage: vu env remove <name> [--force]"; break }
                     $name = $args[2]
+                    $force = $false
+                    if ($args.Count -gt 3) {
+                        for ($j = 3; $j -lt $args.Count; $j++) {
+                            $tok = $args[$j]
+                            if ($tok -eq '--force' -or $tok -eq '-f') { $force = $true }
+                        }
+                    }
+
                     $target = Join-Path -Path $venvRoot -ChildPath $name
                     if (-not (Test-Path -Path $target)) { Write-Host "Environment does not exist: $target" -ForegroundColor Yellow; break }
-                    Remove-Item -Recurse -Force -Path $target
-                    Write-Host "Removed environment: $venvRoot\\$name" -ForegroundColor Green
+
+                    $venvPath = Join-Path -Path $target -ChildPath '.venv'
+
+                    # If this env is currently active, try to deactivate to release file locks
+                    $activeVenv = $env:VIRTUAL_ENV
+                    if (-not [string]::IsNullOrWhiteSpace($activeVenv)) {
+                        $activeResolved = $activeVenv
+                        $targetResolved = $venvPath
+                        try { $activeResolved = (Resolve-Path -Path $activeVenv -ErrorAction Stop).Path } catch {}
+                        try { $targetResolved = (Resolve-Path -Path $venvPath -ErrorAction Stop).Path } catch {}
+                        if ($activeResolved -eq $targetResolved) {
+                            $deact = Get-Command -Name 'deactivate' -ErrorAction SilentlyContinue
+                            if ($deact) { try { deactivate } catch {} }
+                        }
+                    }
+
+                    # If --force is provided, stop python processes that are using this env's python.exe
+                    if ($force -and (Test-Path -Path $venvPath)) {
+                        $pythonExe = Join-Path -Path $venvPath -ChildPath 'Scripts\\python.exe'
+                        $procs = Get-Process -Name 'python','python3' -ErrorAction SilentlyContinue
+                        $toKill = @()
+                        foreach ($p in $procs) {
+                            $pPath = $null
+                            try { $pPath = $p.Path } catch {}
+                            if (-not $pPath) { try { $pPath = $p.MainModule.FileName } catch {} }
+                            if ($pPath -and ($pPath -eq $pythonExe)) { $toKill += $p }
+                        }
+                        if ($toKill.Count -gt 0) {
+                            Write-Host ("Stopping {0} python process(es) from env '{1}'..." -f $toKill.Count, $name) -ForegroundColor Yellow
+                            foreach ($p in $toKill) { try { Stop-Process -Id $p.Id -Force -ErrorAction SilentlyContinue } catch {} }
+                        }
+                    }
+
+                    # Clear read-only attributes before removal
+                    try {
+                        Get-ChildItem -Path $target -Recurse -Force -ErrorAction SilentlyContinue | ForEach-Object {
+                            try { $_.Attributes = 'Normal' } catch {}
+                        }
+                    } catch {}
+
+                    try {
+                        Remove-Item -Recurse -Force -Path $target -ErrorAction Stop
+                        Write-Host "Removed environment: $venvRoot\\$name" -ForegroundColor Green
+                    }
+                    catch {
+                        Write-Host "Failed to remove environment due to locked files." -ForegroundColor Yellow
+                        Write-Host "Tips:" -ForegroundColor DarkGray
+                        Write-Host "  - Close Python REPLs, IDEs, or servers using this env." -ForegroundColor DarkGray
+                        Write-Host "  - Run again with --force to stop python.exe from this env." -ForegroundColor DarkGray
+                        Write-Host "  - Ensure the env is deactivated in the current shell." -ForegroundColor DarkGray
+                    }
                 }
                 default { Write-Error "Unknown env subcommand: $sub. Use 'list' or 'remove'." }
             }
